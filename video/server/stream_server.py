@@ -6,7 +6,7 @@ import numpy as np
 from threading import Thread, Lock
 import cv2
 import time
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, redirect, url_for
 from ast import literal_eval
 from collections import defaultdict
 
@@ -138,6 +138,20 @@ def start_socket_server():
 
 @app.route('/')
 def index():
+    return render_template('login.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        # Here you would typically verify username and password
+        # For now, just redirect to the dashboard
+        return redirect(url_for('dashboard'))
+    else:
+        # If it's a GET request, show the login page
+        return render_template('login.html')
+
+@app.route('/dashboard')
+def dashboard():
     return render_template('index.html')
 
 @app.route('/active_streams')
