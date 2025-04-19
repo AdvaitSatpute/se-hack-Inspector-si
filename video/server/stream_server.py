@@ -27,7 +27,7 @@ genderModel = "gender_net.caffemodel"
 genderNet = cv2.dnn.readNet(genderModel, genderProto)
 genderList = ['Male', 'Female']
 
-MAX_HITS = 10
+MAX_HITS = 20
 GENDER_LOCK_TIMEOUT = 3  # seconds
 
 def safe_client_id_to_tuple(client_id):
