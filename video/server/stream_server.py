@@ -1,4 +1,3 @@
-# server.py
 import socket
 import pickle
 import struct
@@ -15,6 +14,8 @@ app = Flask(__name__, template_folder='../templates', static_folder='../static')
 client_streams = {}
 streams_lock = Lock()
 detection_settings = defaultdict(lambda: {'active': False, 'target_gender': None, 'last_alert': None})
+face_trackers = defaultdict(dict)  # {addr: {face_id: {bbox, hits, genders[], gender, last_seen}}}
+face_id_counter = defaultdict(lambda: 0)
 
 # Load models
 faceProto = "opencv_face_detector.pbtxt"
@@ -26,64 +27,106 @@ genderModel = "gender_net.caffemodel"
 genderNet = cv2.dnn.readNet(genderModel, genderProto)
 genderList = ['Male', 'Female']
 
+MAX_HITS = 10
+GENDER_LOCK_TIMEOUT = 3  # seconds until a lost face is removed
+
+
 def safe_client_id_to_tuple(client_id):
     try:
         if isinstance(client_id, str) and client_id.startswith('('):
             return literal_eval(client_id)
         elif ':' in client_id:
             ip, port = client_id.split(':')
-            return (ip, int(port))
+            return ip, int(port)
     except:
         pass
     return None
 
-def apply_gender_detection(frame):
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0:
+        return 0.0
+
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+
+    return interArea / float(boxAArea + boxBArea - interArea)
+
+
+def match_face_to_tracker(addr, new_box):
+    trackers = face_trackers[addr]
+    for face_id, info in trackers.items():
+        existing_box = info['bbox']
+        if iou(existing_box, new_box) > 0.4:
+            return face_id
+    return None
+
+
+def apply_gender_detection(frame, addr):
     upscale_frame = cv2.resize(frame, (0, 0), fx=1.5, fy=1.5)
     cpy_input_image = upscale_frame.copy()
-    frameWidth = cpy_input_image.shape[1]
-    frameHeight = cpy_input_image.shape[0]
+    frameWidth, frameHeight = upscale_frame.shape[1], upscale_frame.shape[0]
 
-    blob = cv2.dnn.blobFromImage(cpy_input_image, scalefactor=1, size=(227, 227),
-                                 mean=(104, 117, 123), crop=False)
+    blob = cv2.dnn.blobFromImage(upscale_frame, scalefactor=1, size=(300, 300),
+                                 mean=(104, 117, 123), swapRB=False, crop=False)
     faceNet.setInput(blob)
     detections = faceNet.forward()
 
-    detected_gender = None
-
     for i in range(detections.shape[2]):
-        confidence_score = detections[0, 0, i, 2]
-        if confidence_score > 0.7:
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.7:
             x1 = int(detections[0, 0, i, 3] * frameWidth)
             y1 = int(detections[0, 0, i, 4] * frameHeight)
             x2 = int(detections[0, 0, i, 5] * frameWidth)
             y2 = int(detections[0, 0, i, 6] * frameHeight)
 
-            h, w = upscale_frame.shape[:2]
-            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w - 1, x2), min(h - 1, y2)
+            box = (max(0, x1), max(0, y1), min(frameWidth - 1, x2), min(frameHeight - 1, y2))
+            x1, y1, x2, y2 = box
 
-            if x2 - x1 > 0 and y2 - y1 > 0:
-                face_region = upscale_frame[y1:y2, x1:x2]
-                if face_region.size != 0:
-                    gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
-                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                    equalized = clahe.apply(gray)
-                    face_region = cv2.cvtColor(equalized, cv2.COLOR_GRAY2BGR)
+            face_id = match_face_to_tracker(addr, box)
+            if face_id is None:
+                face_id = face_id_counter[addr]
+                face_id_counter[addr] += 1
+                face_trackers[addr][face_id] = {'bbox': box, 'hits': 0, 'genders': [], 'gender': None}
 
-                    blob = cv2.dnn.blobFromImage(face_region, scalefactor=1, size=(227, 227),
-                                                 mean=[78.4263377603, 87.7689143744, 114.895847746], crop=False)
-                    genderNet.setInput(blob)
-                    prediction = genderNet.forward()
+            tracker = face_trackers[addr][face_id]
+            tracker['bbox'] = box
+            tracker['last_seen'] = time.time()
 
-                    top_gender = genderList[prediction[0].argmax()]
-                    confidence = prediction[0].max()
+            if tracker['gender'] is None and tracker['hits'] < MAX_HITS:
+                face_img = upscale_frame[y1:y2, x1:x2]
+                if face_img.size == 0:
+                    continue
+                face_blob = cv2.dnn.blobFromImage(face_img, scalefactor=1, size=(227, 227),
+                                                  mean=[78.4263377603, 87.7689143744, 114.895847746], crop=False)
+                genderNet.setInput(face_blob)
+                gender_preds = genderNet.forward()
+                gender = genderList[gender_preds[0].argmax()]
+                tracker['genders'].append(gender)
+                tracker['hits'] += 1
 
-                    if confidence > 0.6:
-                        detected_gender = top_gender
-                        cv2.rectangle(cpy_input_image, (x1, y1), (x2, y2), (255, 0, 0), 1)
-                        cv2.putText(cpy_input_image, detected_gender, (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_COMPLEX, 0.8, (0, 255, 0), 1)
+                if tracker['hits'] == MAX_HITS:
+                    # Decide final gender
+                    tracker['gender'] = max(set(tracker['genders']), key=tracker['genders'].count)
 
-    return cpy_input_image, detected_gender
+            label = tracker['gender'] or f"Detecting {tracker['hits']}/{MAX_HITS}"
+            cv2.rectangle(cpy_input_image, (x1, y1), (x2, y2), (255, 0, 0), 1)
+            cv2.putText(cpy_input_image, f"ID {face_id}: {label}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+
+    # Clean up old faces
+    now = time.time()
+    face_trackers[addr] = {fid: data for fid, data in face_trackers[addr].items()
+                           if now - data.get('last_seen', 0) <= GENDER_LOCK_TIMEOUT}
+
+    return cpy_input_image
+
 
 def handle_client(conn, addr):
     print(f"Connected: {addr}")
@@ -125,6 +168,7 @@ def handle_client(conn, addr):
         conn.close()
         print(f"Connection closed: {addr}")
 
+
 def start_socket_server():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -136,15 +180,18 @@ def start_socket_server():
         conn, addr = server_socket.accept()
         Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
+
 @app.route('/')
 def index():
     return render_template('index.html')
+
 
 @app.route('/active_streams')
 def active_streams():
     with streams_lock:
         clients = [f"{ip}:{port}" for ip, port in client_streams.keys()]
     return jsonify({'clients': clients})
+
 
 @app.route('/toggle_detection/<client_id>', methods=['POST'])
 def toggle_detection(client_id):
@@ -155,22 +202,18 @@ def toggle_detection(client_id):
     data = request.get_json()
     gender = data.get('gender')
 
-    if addr not in detection_settings:
-        detection_settings[addr] = {}
-
     if gender == 'None':
         detection_settings[addr]['active'] = False
         detection_settings[addr]['target_gender'] = None
         detection_settings[addr]['last_alert'] = None
         return jsonify({'status': 'Detection deactivated'})
-    
+
     if gender not in genderList:
         return jsonify({'error': 'Invalid gender'}), 400
 
     detection_settings[addr]['active'] = True
     detection_settings[addr]['target_gender'] = gender
     detection_settings[addr]['last_alert'] = None
-
     return jsonify({'status': f'Detection ON for {gender}'})
 
 
@@ -193,13 +236,7 @@ def video_feed(client_id):
             if stream_data:
                 frame = cv2.imdecode(np.frombuffer(stream_data['frame'], np.uint8), cv2.IMREAD_COLOR)
                 if settings['active']:
-                    frame, detected_gender = apply_gender_detection(frame)
-                    if detected_gender == settings.get('target_gender'):
-                        if settings.get('last_alert') != detected_gender:
-                            print(f"Alert: {detected_gender} detected for {addr}")
-                            settings['last_alert'] = detected_gender
-                    else:
-                        settings['last_alert'] = None
+                    frame = apply_gender_detection(frame, addr)
                 _, buffer = cv2.imencode('.jpg', frame)
                 frame_bytes = buffer.tobytes()
             else:
@@ -207,10 +244,10 @@ def video_feed(client_id):
 
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
                    frame_bytes + b'\r\n')
-
             time.sleep(0.033)
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 if __name__ == '__main__':
     Thread(target=start_socket_server, daemon=True).start()
