@@ -5,6 +5,7 @@ import numpy as np
 from threading import Thread, Lock
 import cv2
 import time
+import logging
 from flask import Flask, Response, jsonify, render_template, request
 from ast import literal_eval
 from collections import defaultdict
@@ -14,7 +15,7 @@ app = Flask(__name__, template_folder='../templates', static_folder='../static')
 client_streams = {}
 streams_lock = Lock()
 detection_settings = defaultdict(lambda: {'active': False, 'target_gender': None, 'last_alert': None})
-face_trackers = defaultdict(dict)  # {addr: {face_id: {bbox, hits, genders[], gender, last_seen}}}
+face_trackers = defaultdict(dict)
 face_id_counter = defaultdict(lambda: 0)
 
 # Load models
@@ -28,8 +29,7 @@ genderNet = cv2.dnn.readNet(genderModel, genderProto)
 genderList = ['Male', 'Female']
 
 MAX_HITS = 10
-GENDER_LOCK_TIMEOUT = 3  # seconds until a lost face is removed
-
+GENDER_LOCK_TIMEOUT = 3  # seconds
 
 def safe_client_id_to_tuple(client_id):
     try:
@@ -42,22 +42,17 @@ def safe_client_id_to_tuple(client_id):
         pass
     return None
 
-
 def iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
     yB = min(boxA[3], boxB[3])
-
     interArea = max(0, xB - xA) * max(0, yB - yA)
     if interArea == 0:
         return 0.0
-
     boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
     boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-
     return interArea / float(boxAArea + boxBArea - interArea)
-
 
 def match_face_to_tracker(addr, new_box):
     trackers = face_trackers[addr]
@@ -66,7 +61,6 @@ def match_face_to_tracker(addr, new_box):
         if iou(existing_box, new_box) > 0.4:
             return face_id
     return None
-
 
 def apply_gender_detection(frame, addr):
     upscale_frame = cv2.resize(frame, (0, 0), fx=1.5, fy=1.5)
@@ -77,6 +71,8 @@ def apply_gender_detection(frame, addr):
                                  mean=(104, 117, 123), swapRB=False, crop=False)
     faceNet.setInput(blob)
     detections = faceNet.forward()
+
+    detected_genders = set()
 
     for i in range(detections.shape[2]):
         confidence = detections[0, 0, i, 2]
@@ -112,21 +108,21 @@ def apply_gender_detection(frame, addr):
                 tracker['hits'] += 1
 
                 if tracker['hits'] == MAX_HITS:
-                    # Decide final gender
                     tracker['gender'] = max(set(tracker['genders']), key=tracker['genders'].count)
 
             label = tracker['gender'] or f"Detecting {tracker['hits']}/{MAX_HITS}"
+            if tracker['gender']:
+                detected_genders.add(tracker['gender'])
+
             cv2.rectangle(cpy_input_image, (x1, y1), (x2, y2), (255, 0, 0), 1)
             cv2.putText(cpy_input_image, f"ID {face_id}: {label}", (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
 
-    # Clean up old faces
     now = time.time()
     face_trackers[addr] = {fid: data for fid, data in face_trackers[addr].items()
                            if now - data.get('last_seen', 0) <= GENDER_LOCK_TIMEOUT}
 
-    return cpy_input_image
-
+    return cpy_input_image, detected_genders
 
 def handle_client(conn, addr):
     print(f"Connected: {addr}")
@@ -136,7 +132,7 @@ def handle_client(conn, addr):
     try:
         while True:
             while len(data) < payload_size:
-                packet = conn.recv(4 * 1024)
+                packet = conn.recv(4096)
                 if not packet:
                     raise ConnectionError("Client disconnected")
                 data += packet
@@ -146,7 +142,7 @@ def handle_client(conn, addr):
             msg_size = struct.unpack("Q", packed_msg_size)[0]
 
             while len(data) < msg_size:
-                packet = conn.recv(4 * 1024)
+                packet = conn.recv(4096)
                 if not packet:
                     raise ConnectionError("Client disconnected")
                 data += packet
@@ -168,7 +164,6 @@ def handle_client(conn, addr):
         conn.close()
         print(f"Connection closed: {addr}")
 
-
 def start_socket_server():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -180,18 +175,15 @@ def start_socket_server():
         conn, addr = server_socket.accept()
         Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
-
 @app.route('/')
 def index():
     return render_template('index.html')
-
 
 @app.route('/active_streams')
 def active_streams():
     with streams_lock:
         clients = [f"{ip}:{port}" for ip, port in client_streams.keys()]
     return jsonify({'clients': clients})
-
 
 @app.route('/toggle_detection/<client_id>', methods=['POST'])
 def toggle_detection(client_id):
@@ -216,7 +208,6 @@ def toggle_detection(client_id):
     detection_settings[addr]['last_alert'] = None
     return jsonify({'status': f'Detection ON for {gender}'})
 
-
 @app.route('/video_feed/<client_id>')
 def video_feed(client_id):
     def generate():
@@ -228,7 +219,6 @@ def video_feed(client_id):
 
         while True:
             addr = safe_client_id_to_tuple(client_id)
-
             with streams_lock:
                 stream_data = client_streams.get(addr) if addr else None
                 settings = detection_settings[addr] if addr else {'active': False}
@@ -236,19 +226,28 @@ def video_feed(client_id):
             if stream_data:
                 frame = cv2.imdecode(np.frombuffer(stream_data['frame'], np.uint8), cv2.IMREAD_COLOR)
                 if settings['active']:
-                    frame = apply_gender_detection(frame, addr)
+                    frame, detected_genders = apply_gender_detection(frame, addr)
+                    if settings['target_gender'] in detected_genders:
+                        if settings.get('last_alert') != settings['target_gender']:
+                            print(f"🔔 ALERT: {settings['target_gender']} detected for {addr}")
+                            settings['last_alert'] = settings['target_gender']
+                    else:
+                        settings['last_alert'] = None
+
                 _, buffer = cv2.imencode('.jpg', frame)
                 frame_bytes = buffer.tobytes()
             else:
                 frame_bytes = no_signal_frame
 
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
-                   frame_bytes + b'\r\n')
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             time.sleep(0.033)
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-
 if __name__ == '__main__':
+    # Suppress Flask request logs
+    #log = logging.getLogger('werkzeug')
+    #log.setLevel(logging.ERROR)
+
     Thread(target=start_socket_server, daemon=True).start()
     app.run(host='0.0.0.0', port=5000, threaded=True)
