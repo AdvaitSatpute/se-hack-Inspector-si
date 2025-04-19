@@ -100,3 +100,47 @@ h1 {
         grid-template-columns: 1fr;
     }
 }
+
+/* Additional styles for status indicators */
+.status-indicators {
+    display: flex;
+    gap: 15px;
+    margin: 10px 0;
+    padding: 0 10px;
+    color: white;
+}
+
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.indicator {
+    display: inline-block;
+}
+
+/* Button classes */
+.activate-btn {
+    background-color: #4CAF50;
+}
+
+.activate-btn:hover {
+    background-color: #45a049;
+}
+
+.deactivate-btn {
+    background-color: #f44336;
+}
+
+.deactivate-btn:hover {
+    background-color: #d32f2f;
+}
+
+.remove-btn {
+    background-color: #9e9e9e;
+}
+
+.remove-btn:hover {
+    background-color: #757575;
+}
