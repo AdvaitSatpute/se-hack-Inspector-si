@@ -49,8 +49,19 @@ except:
 min_area = 600
 threshold_value = 25
 
+# Unattended object detection parameters
+MIN_CONTOUR_AREA = 400
+PERSISTENCE_FRAMES = 100
+LEARNING_RATE = 0.010
+MATCH_DISTANCE = 100  # Maximum distance for object matching
+
 # Store previous keypoints for fight detection (per client)
 previous_keypoints = {}
+
+# Store tracked objects for unattended object detection (per client)
+unattended_objects = defaultdict(dict)
+object_id_counters = defaultdict(int)
+background_models = {}
 
 
 def safe_client_id_to_tuple(client_id):
@@ -65,6 +76,7 @@ def safe_client_id_to_tuple(client_id):
         pass
     return None
 
+
 def iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
@@ -77,6 +89,7 @@ def iou(boxA, boxB):
     boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
     return interArea / float(boxAArea + boxBArea - interArea)
 
+
 def match_face_to_tracker(addr, new_box):
     trackers = face_trackers[addr]
     for face_id, info in trackers.items():
@@ -84,6 +97,7 @@ def match_face_to_tracker(addr, new_box):
         if iou(existing_box, new_box) > 0.4:
             return face_id
     return None
+
 
 def apply_gender_detection(frame, addr):
     upscale_frame = cv2.resize(frame, (0, 0), fx=1.5, fy=1.5)
@@ -298,6 +312,137 @@ def process_motion_detection(frame, addr):
     return frame, motion_detected, fight_detected
 
 
+def process_unattended_object_detection(frame, addr):
+    """Detect unattended objects in the frame"""
+    # Convert to grayscale and preprocess
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    gray = cv2.GaussianBlur(gray, (9, 9), 2)
+    
+    # Initialize or get background model for this client
+    if addr not in background_models:
+        background_models[addr] = {
+            'model': cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False),
+            'static_bg': None
+        }
+    
+    # Apply background subtraction
+    if background_models[addr]['static_bg'] is not None:
+        diff = cv2.absdiff(gray, background_models[addr]['static_bg'])
+        _, fg_mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+    else:
+        fg_mask = background_models[addr]['model'].apply(gray, learningRate=LEARNING_RATE)
+    
+    # Noise reduction
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    fg_mask = cv2.dilate(fg_mask, kernel, iterations=1)
+    
+    # Find contours
+    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    current_objects = []
+    for contour in contours:
+        if cv2.contourArea(contour) < MIN_CONTOUR_AREA:
+            continue
+        
+        x, y, w, h = cv2.boundingRect(contour)
+        cx = x + w // 2
+        cy = y + h // 2
+        current_objects.append((cx, cy, x, y, w, h))
+    
+    # Get tracked objects for this client
+    tracked_objects = unattended_objects[addr]
+    updated_objects = {}
+    used_ids = set()
+    
+    # Try to match existing objects
+    for obj in current_objects:
+        cx, cy, x, y, w, h = obj
+        best_match = None
+        min_distance = float('inf')
+        
+        for obj_id, data in tracked_objects.items():
+            if obj_id in used_ids:
+                continue
+            
+            last_pos = data['positions'][-1]
+            distance = np.sqrt((cx - last_pos[0])**2 + (cy - last_pos[1])**2)
+            
+            if distance < MATCH_DISTANCE and distance < min_distance:
+                min_distance = distance
+                best_match = obj_id
+        
+        if best_match is not None:
+            # Update existing object
+            tracked_objects[best_match]['positions'].append((cx, cy))
+            tracked_objects[best_match]['bbox'] = (x, y, w, h)
+            if len(tracked_objects[best_match]['positions']) > PERSISTENCE_FRAMES:
+                tracked_objects[best_match]['positions'].pop(0)
+            updated_objects[best_match] = tracked_objects[best_match]
+            used_ids.add(best_match)
+        else:
+            # Create new object
+            updated_objects[object_id_counters[addr]] = {
+                'positions': [(cx, cy)],
+                'bbox': (x, y, w, h),
+                'age': 0
+            }
+            object_id_counters[addr] += 1
+    
+    # Handle unmatched existing objects
+    for obj_id, data in tracked_objects.items():
+        if obj_id not in used_ids:
+            data['age'] += 1
+            if data['age'] < 10:  # Keep objects for 10 frames after disappearance
+                updated_objects[obj_id] = data
+    
+    unattended_objects[addr] = updated_objects
+    
+    # Draw persistent objects and count them
+    unattended_count = 0
+    for obj_id, data in unattended_objects[addr].items():
+        if len(data['positions']) >= PERSISTENCE_FRAMES:
+            unattended_count += 1
+            x, y, w, h = data['bbox']
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            cv2.putText(frame, f'Unattended Object {obj_id}', (x, y-10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    
+    # Display unattended object count
+    cv2.putText(frame, f"Unattended Objects: {unattended_count}", 
+                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255) if unattended_count > 0 else (0, 255, 0), 2)
+    
+    # Update client stream data
+    with streams_lock:
+        if addr in client_streams:
+            client_streams[addr]['unattended_objects'] = unattended_count
+            client_streams[addr]['fg_mask'] = fg_mask
+    
+    return frame, unattended_count
+
+
+def set_background_for_client(addr, frame):
+    """Set static background for unattended object detection"""
+    if frame is not None:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        processed_bg = clahe.apply(gray)
+        processed_bg = cv2.GaussianBlur(processed_bg, (9, 9), 2)
+        
+        if addr not in background_models:
+            background_models[addr] = {
+                'model': cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False),
+                'static_bg': None
+            }
+        
+        background_models[addr]['static_bg'] = processed_bg
+        return True
+    return False
+
+
 def handle_client(conn, addr):
     print(f"Connected: {addr}")
     data = b""
@@ -325,7 +470,7 @@ def handle_client(conn, addr):
             data = data[msg_size:]
             frame = pickle.loads(frame_data)
             
-            # Store original frame for gender detection
+            # Store original frame for detection
             original_frame = frame.copy()
             
             # Process frame based on detection mode set for this client
@@ -343,18 +488,33 @@ def handle_client(conn, addr):
                             settings['last_alert'] = settings.get('target_gender')
                     else:
                         settings['last_alert'] = None
-                        
+                    
                     motion_detected = False
                     fight_detected = False
-                else:  # Mode is motion
+                    unattended_count = 0
+                elif settings['mode'] == 'motion':
                     processed_frame, motion_detected, fight_detected = process_motion_detection(original_frame, addr)
                     detected_gender = []
+                    unattended_count = 0
+                elif settings['mode'] == 'unattended':
+                    processed_frame, unattended_count = process_unattended_object_detection(original_frame, addr)
+                    motion_detected = False
+                    fight_detected = False
+                    detected_gender = []
+                else:
+                    # Default to original frame if unknown mode
+                    processed_frame = original_frame
+                    motion_detected = False
+                    fight_detected = False
+                    detected_gender = []
+                    unattended_count = 0
             else:
                 # If detection is not active, just use the original frame
                 processed_frame = original_frame
                 motion_detected = False
                 fight_detected = False
                 detected_gender = []
+                unattended_count = 0
             
             ret, buffer = cv2.imencode('.jpg', processed_frame)
             if not ret:
@@ -366,7 +526,8 @@ def handle_client(conn, addr):
                     'timestamp': time.time(),
                     'motion_detected': motion_detected,
                     'fight_detected': fight_detected,
-                    'detected_gender': detected_gender
+                    'detected_gender': detected_gender,
+                    'unattended_objects': unattended_count
                 }
     except Exception as e:
         print(f"Client {addr} error: {str(e)}")
@@ -375,6 +536,10 @@ def handle_client(conn, addr):
             client_streams.pop(addr, None)
             if addr in previous_keypoints:
                 del previous_keypoints[addr]
+            if addr in unattended_objects:
+                del unattended_objects[addr]
+            if addr in background_models:
+                del background_models[addr]
         conn.close()
         print(f"Connection closed: {addr}")
 
@@ -424,6 +589,8 @@ def active_streams():
             del client_streams[client]
             if client in previous_keypoints:
                 del previous_keypoints[client]
+            if client in unattended_objects:
+                del unattended_objects[client]
                 
         # Get client ids as strings and convert to list for JSON serialization
         client_ids = [f"{ip}:{port}" for ip, port in client_streams.keys()]
@@ -442,9 +609,11 @@ def active_streams():
                 'motion_detected': client_streams[addr].get('motion_detected', False),
                 'fight_detected': client_streams[addr].get('fight_detected', False),
                 'detected_gender': detected_gender[0] if detected_gender else None,
+                'unattended_objects': client_streams[addr].get('unattended_objects', 0),
                 'mode': detection_settings[addr].get('mode', None),
                 'active': detection_settings[addr].get('active', False),
-                'target_gender': detection_settings[addr].get('target_gender', None)
+                'target_gender': detection_settings[addr].get('target_gender', None),
+                'has_background': background_models.get(addr, {}).get('static_bg') is not None
             }
             
     return jsonify({
@@ -482,10 +651,40 @@ def toggle_detection(client_id):
             return jsonify({'error': 'Invalid gender specified'}), 400
     elif mode == 'motion':
         return jsonify({'status': 'Motion detection ' + ('activated' if active else 'deactivated')})
+    elif mode == 'unattended':
+        return jsonify({'status': 'Unattended object detection ' + ('activated' if active else 'deactivated')})
     else:
         return jsonify({'error': 'Invalid detection mode'}), 400
 
 
+@app.route('/set_background/<client_id>', methods=['POST'])
+def set_background(client_id):
+    addr = safe_client_id_to_tuple(client_id)
+    if not addr:
+        return jsonify({'error': 'Invalid client ID'}), 400
+    
+    with streams_lock:
+        if addr in client_streams:
+            # Get the last frame from the client
+            frame_data = client_streams[addr].get('frame')
+            if frame_data:
+                try:
+                    # Convert JPEG bytes back to numpy array
+                    nparr = np.frombuffer(frame_data, np.uint8)
+                    last_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if last_frame is not None and last_frame.size > 0:
+                        success = set_background_for_client(addr, last_frame)
+                        if success:
+                            # Reset tracking for this client
+                            if addr in unattended_objects:
+                                unattended_objects[addr] = {}
+                            object_id_counters[addr] = 0
+                            return jsonify({'status': 'Background set successfully'})
+                except Exception as e:
+                    print(f"Error setting background: {str(e)}")
+    
+    return jsonify({'error': 'Could not set background, no frame available'}), 400
+                    
 @app.route('/video_feed/<client_id>')
 def video_feed(client_id):
     def generate():
@@ -512,10 +711,133 @@ def video_feed(client_id):
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
+@app.route('/reset_trackers/<client_id>', methods=['POST'])
+def reset_trackers(client_id):
+    """Reset face trackers and object trackers for a client"""
+    addr = safe_client_id_to_tuple(client_id)
+    if not addr:
+        return jsonify({'error': 'Invalid client ID'}), 400
+
+    with streams_lock:
+        if addr in face_trackers:
+            face_trackers[addr] = {}
+            face_id_counter[addr] = 0
+        
+        if addr in unattended_objects:
+            unattended_objects[addr] = {}
+            object_id_counters[addr] = 0
+            
+    return jsonify({'status': 'Trackers reset successfully'})
+
+
+@app.route('/detection_stats')
+def detection_stats():
+    """Get statistics for all active detection streams"""
+    with streams_lock:
+        stats = {}
+        for addr, data in client_streams.items():
+            client_id = f"{addr[0]}:{addr[1]}"
+            stats[client_id] = {
+                'motion_detected': data.get('motion_detected', False),
+                'fight_detected': data.get('fight_detected', False),
+                'detected_gender': data.get('detected_gender', []),
+                'unattended_objects': data.get('unattended_objects', 0),
+                'mode': detection_settings[addr].get('mode', None),
+                'active': detection_settings[addr].get('active', False),
+                'target_gender': detection_settings[addr].get('target_gender', None)
+            }
+            
+    return jsonify(stats)
+
+
+@app.route('/system_info')
+def system_info():
+    """Get system information"""
+    models_loaded = {
+        'face_detection': faceNet is not None,
+        'gender_detection': genderNet is not None,
+        'pose_detection': yolo_model is not None,
+        'hand_detection': use_hand_dnn
+    }
+    
+    active_clients = len(client_streams)
+    
+    return jsonify({
+        'models_loaded': models_loaded,
+        'active_clients': active_clients,
+        'detection_modes': ['gender', 'motion', 'unattended']
+    })
+
+
+@app.route('/view_background/<client_id>')
+def view_background(client_id):
+    """View the stored background for a client"""
+    addr = safe_client_id_to_tuple(client_id)
+    if not addr or addr not in background_models or background_models[addr].get('static_bg') is None:
+        return jsonify({'error': 'No background available for this client'}), 404
+    
+    bg = background_models[addr]['static_bg']
+    # Convert single channel to 3 channels for display
+    bg_display = cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
+    _, buffer = cv2.imencode('.jpg', bg_display)
+    
+    return Response(buffer.tobytes(), mimetype='image/jpeg')
+
+
+@app.route('/api/health')
+def health_check():
+    """Health check endpoint for monitoring"""
+    return jsonify({
+        'status': 'healthy',
+        'time': time.time(),
+        'active_clients': len(client_streams)
+    })
+
+
+@app.route('/api/snapshot/<client_id>', methods=['GET'])
+def take_snapshot(client_id):
+    """Take a snapshot from the client's video feed"""
+    addr = safe_client_id_to_tuple(client_id)
+    if not addr or addr not in client_streams:
+        return jsonify({'error': 'Client not found or not connected'}), 404
+    
+    with streams_lock:
+        frame_data = client_streams.get(addr, {}).get('frame')
+        if not frame_data:
+            return jsonify({'error': 'No frame available'}), 404
+    
+    # Create a timestamp for the filename
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"snapshot_{addr[0]}_{addr[1]}_{timestamp}.jpg"
+    
+    # Save the snapshot to disk
+    try:
+        # Convert the JPEG binary data back to numpy array
+        nparr = np.frombuffer(frame_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        cv2.imwrite(f"snapshots/{filename}", img)
+        
+        return jsonify({
+            'status': 'success',
+            'filename': filename,
+            'timestamp': timestamp
+        })
+    except Exception as e:
+        return jsonify({'error': f'Failed to save snapshot: {str(e)}'}), 500
+
+
 if __name__ == '__main__':
-    # Suppress Flask request logs
+    # Create snapshots directory if it doesn't exist
+    import os
+    if not os.path.exists("snapshots"):
+        os.makedirs("snapshots")
+    
+    # Suppress Flask request logs for cleaner console output
     #log = logging.getLogger('werkzeug')
     #log.setLevel(logging.ERROR)
 
+    # Start the socket server in a background thread
     Thread(target=start_socket_server, daemon=True).start()
+    
+    # Start the Flask application
     app.run(host='0.0.0.0', port=5000, threaded=True)

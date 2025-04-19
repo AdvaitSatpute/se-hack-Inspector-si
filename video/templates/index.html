@@ -99,18 +99,26 @@
             background-color: #2b3a55;
             color: white;
         }
+        .alert-indicator {
+            color: #ff5252;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .background-controls {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
     <div style="display: flex; align-items: center; justify-content: space-between; background-color: #2b3a55; padding: 15px 30px; color: white;">
         <div style="font-size: 24px; font-weight: bold;">
-          CCTV Monitor
+          Smart CCTV Monitor
         </div>
         <div style="display: flex; gap: 20px;">
-          <a href="/" style="color: white; text-decoration: none; font-size: 16px;">Home</a>
-          <a href="/live-feed" style="color: white; text-decoration: none; font-size: 16px;">Live Feed</a>
-          <a href="/recordings" style="color: white; text-decoration: none; font-size: 16px;">Recordings</a>
-          <a href="/settings" style="color: white; text-decoration: none; font-size: 16px;">Settings</a>
+          <a href="/" style="color: white; text-decoration: none; font-size: 16px;">Dashboard</a>
+          <a href="/system-info" style="color: white; text-decoration: none; font-size: 16px;">System Info</a>
         </div>
     </div>
     <div class="container">
@@ -169,6 +177,7 @@
                         modeControlsEl.innerHTML = `
                             <button class="mode-btn gender-mode" onclick="setDetectionMode('${clientId}', 'gender')">Gender Detection</button>
                             <button class="mode-btn motion-mode" onclick="setDetectionMode('${clientId}', 'motion')">Motion Detection</button>
+                            <button class="mode-btn unattended-mode" onclick="setDetectionMode('${clientId}', 'unattended')">Unattended Objects</button>
                         `;
                         controlsEl.appendChild(modeControlsEl);
                         
@@ -184,6 +193,15 @@
                             </select>
                         `;
                         controlsEl.appendChild(genderRowEl);
+                        
+                        // Create background controls row
+                        const bgRowEl = document.createElement('div');
+                        bgRowEl.className = 'background-controls';
+                        bgRowEl.innerHTML = `
+                            <button class="btn btn-primary" onclick="setBackground('${clientId}')">Set Background</button>
+                            <button class="btn btn-primary" onclick="resetTrackers('${clientId}')">Reset Trackers</button>
+                        `;
+                        controlsEl.appendChild(bgRowEl);
                         
                         // Create toggle button row
                         const toggleRowEl = document.createElement('div');
@@ -205,6 +223,7 @@
                         statusRowEl.innerHTML = `
                             <div id="detection-status-${clientId}">
                                 <span id="detection-info-${clientId}"></span>
+                                <span id="alert-indicator-${clientId}" class="alert-indicator"></span>
                             </div>
                         `;
                         controlsEl.appendChild(statusRowEl);
@@ -223,23 +242,34 @@
                 const statusText = document.getElementById(`status-text-${clientId}`);
                 const toggleBtn = document.getElementById(`toggle-${clientId}`);
                 const detectionInfo = document.getElementById(`detection-info-${clientId}`);
+                const alertIndicator = document.getElementById(`alert-indicator-${clientId}`);
                 const genderModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .gender-mode`);
                 const motionModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .motion-mode`);
+                const unattendedModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .unattended-mode`);
                 const genderControls = document.querySelector(`.video-container[data-client-id="${clientId}"] .gender-controls`);
                 
                 // Update active mode buttons
+                genderModeBtn?.classList.remove('active');
+                motionModeBtn?.classList.remove('active');
+                unattendedModeBtn?.classList.remove('active');
+                
                 if (status.mode === 'gender') {
-                    genderModeBtn.classList.add('active');
-                    motionModeBtn.classList.remove('active');
+                    genderModeBtn?.classList.add('active');
                     genderControls.style.display = 'flex';
                 } else if (status.mode === 'motion') {
-                    motionModeBtn.classList.add('active');
-                    genderModeBtn.classList.remove('active');
+                    motionModeBtn?.classList.add('active');
+                    genderControls.style.display = 'none';
+                } else if (status.mode === 'unattended') {
+                    unattendedModeBtn?.classList.add('active');
                     genderControls.style.display = 'none';
                 } else {
-                    genderModeBtn.classList.remove('active');
-                    motionModeBtn.classList.remove('active');
-                    genderControls.style.display = 'flex'; // Default to showing gender controls
+                    genderControls.style.display = 'flex';
+                }
+                
+                // Update target gender selection
+                const genderSelect = document.getElementById(`gender-${clientId}`);
+                if (genderSelect && status.target_gender) {
+                    genderSelect.value = status.target_gender;
                 }
                 
                 // Update active status
@@ -257,20 +287,35 @@
                 
                 // Update detection info
                 let detectionText = '';
+                let alertText = '';
+                
                 if (status.active) {
                     if (status.mode === 'gender' && status.detected_gender) {
                         detectionText = `Detected: ${status.detected_gender}`;
+                        if (status.target_gender && status.detected_gender === status.target_gender) {
+                            alertText = 'ALERT: Target gender detected!';
+                        }
                     } else if (status.mode === 'motion') {
                         if (status.fight_detected) {
                             detectionText = 'Fight detected!';
+                            alertText = 'ALERT: Fight detected!';
                         } else if (status.motion_detected) {
                             detectionText = 'Motion detected';
                         } else {
                             detectionText = 'No motion detected';
                         }
+                    } else if (status.mode === 'unattended') {
+                        if (status.unattended_objects > 0) {
+                            detectionText = `Unattended objects: ${status.unattended_objects}`;
+                            alertText = 'ALERT: Unattended object detected!';
+                        } else {
+                            detectionText = 'No unattended objects';
+                        }
                     }
                 }
+                
                 detectionInfo.textContent = detectionText;
+                alertIndicator.textContent = alertText;
             }
             
             // Start polling
@@ -335,7 +380,13 @@
             
             // Determine the current mode
             const genderModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .gender-mode`);
-            const mode = genderModeBtn && genderModeBtn.classList.contains('active') ? 'gender' : 'motion';
+            const motionModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .motion-mode`);
+            const unattendedModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .unattended-mode`);
+            
+            let mode = 'none';
+            if (genderModeBtn && genderModeBtn.classList.contains('active')) mode = 'gender';
+            else if (motionModeBtn && motionModeBtn.classList.contains('active')) mode = 'motion';
+            else if (unattendedModeBtn && unattendedModeBtn.classList.contains('active')) mode = 'unattended';
             
             // Get gender if in gender mode
             let gender = 'None';
@@ -362,6 +413,37 @@
                 console.log('Detection toggled:', data);
             })
             .catch(error => console.error('Error toggling detection:', error));
+        }
+        
+        function setBackground(clientId) {
+            fetch(`/set_background/${clientId}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+            })
+            .then(response => response.json())
+            .then(data => {
+                alert(data.status || data.error);
+            })
+            .catch(error => {
+                console.error('Error setting background:', error);
+                alert('Failed to set background');
+            });
+        }
+        
+        function resetTrackers(clientId) {
+            fetch(`/reset_trackers/${clientId}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('Trackers reset:', data);
+            })
+            .catch(error => console.error('Error resetting trackers:', error));
         }
     </script>
 </body>
