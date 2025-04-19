@@ -6,18 +6,17 @@ from threading import Thread, Lock
 import cv2
 import time
 import logging
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, redirect, url_for
 from ast import literal_eval
 from collections import defaultdict
 from ultralytics import YOLO  # YOLOv8
-import mediapipe as mp
 
 app = Flask(__name__, template_folder='../templates', static_folder='../static')
 
 # Dictionary to hold client streams with thread-safe access
 client_streams = {}
 streams_lock = Lock()
-detection_settings = defaultdict(lambda: {'active': False, 'target_gender': None, 'last_alert': None})
+detection_settings = defaultdict(lambda: {'active': False, 'target_gender': None, 'last_alert': None, 'mode': None})
 face_trackers = defaultdict(dict)
 face_id_counter = defaultdict(lambda: 0)
 
@@ -31,13 +30,20 @@ genderModel = "gender_net.caffemodel"
 genderNet = cv2.dnn.readNet(genderModel, genderProto)
 genderList = ['Male', 'Female']
 
-MAX_HITS = 10
+MAX_HITS = 15
 GENDER_LOCK_TIMEOUT = 3  # seconds
 # Initialize Motion Detection models
 yolo_model = YOLO('yolov8n-pose.pt')  # YOLOv8 small pose model
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
-mp_drawing = mp.solutions.drawing_utils
+
+# Using OpenCV's DNN-based hand detector instead of MediaPipe
+handProto = "hand_detector.prototxt"  # You'll need to provide these files
+handModel = "hand_detector.caffemodel"  # You'll need to provide these files
+try:
+    handNet = cv2.dnn.readNet(handModel, handProto)
+    use_hand_dnn = True
+except:
+    print("Hand detection model files not found. Using pose detection for hand tracking.")
+    use_hand_dnn = False
 
 # Motion detection parameters
 min_area = 600
@@ -139,7 +145,33 @@ def apply_gender_detection(frame, addr):
     face_trackers[addr] = {fid: data for fid, data in face_trackers[addr].items()
                            if now - data.get('last_seen', 0) <= GENDER_LOCK_TIMEOUT}
 
-    return cpy_input_image, detected_genders
+    # Convert set to list for JSON serialization
+    return cpy_input_image, list(detected_genders)
+
+
+def detect_hands_opencv(frame):
+    """Detect hands using OpenCV DNN instead of MediaPipe"""
+    if not use_hand_dnn:
+        return frame, False
+    
+    height, width = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), [127.5, 127.5, 127.5], swapRB=True, crop=False)
+    handNet.setInput(blob)
+    detections = handNet.forward()
+    
+    hand_detected = False
+    
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.5:
+            hand_detected = True
+            box = detections[0, 0, i, 3:7] * np.array([width, height, width, height])
+            (x, y, x2, y2) = box.astype("int")
+            cv2.rectangle(frame, (x, y), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"Hand: {confidence:.2f}", (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    
+    return frame, hand_detected
 
 
 def process_motion_detection(frame, addr):
@@ -209,13 +241,8 @@ def process_motion_detection(frame, addr):
                         if xa > 0 and ya > 0 and xb > 0 and yb > 0:
                             cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), color, 2)
     
-    # Hand detection
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results_hands = hands.process(rgb_frame)
-    
-    if results_hands.multi_hand_landmarks:
-        for hand_landmarks in results_hands.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+    # Hand detection using OpenCV DNN
+    frame, hand_detected = detect_hands_opencv(frame)
     
     # Fight detection logic
     fight_detected = False
@@ -307,13 +334,13 @@ def handle_client(conn, addr):
                 
             if settings['active']:
                 if settings['mode'] == 'gender':
-                    processed_frame, detected_gender = apply_gender_detection(original_frame)
+                    processed_frame, detected_gender = apply_gender_detection(original_frame, addr)
                     
                     # Update gender detection alert status
-                    if detected_gender == settings.get('target_gender'):
-                        if settings.get('last_alert') != detected_gender:
-                            print(f"Alert: {detected_gender} detected for {addr}")
-                            settings['last_alert'] = detected_gender
+                    if detected_gender and settings.get('target_gender') in detected_gender:
+                        if settings.get('last_alert') != settings.get('target_gender'):
+                            print(f"Alert: {settings.get('target_gender')} detected for {addr}")
+                            settings['last_alert'] = settings.get('target_gender')
                     else:
                         settings['last_alert'] = None
                         
@@ -321,13 +348,13 @@ def handle_client(conn, addr):
                     fight_detected = False
                 else:  # Mode is motion
                     processed_frame, motion_detected, fight_detected = process_motion_detection(original_frame, addr)
-                    detected_gender = None
+                    detected_gender = []
             else:
                 # If detection is not active, just use the original frame
                 processed_frame = original_frame
                 motion_detected = False
                 fight_detected = False
-                detected_gender = None
+                detected_gender = []
             
             ret, buffer = cv2.imencode('.jpg', processed_frame)
             if not ret:
@@ -398,19 +425,26 @@ def active_streams():
             if client in previous_keypoints:
                 del previous_keypoints[client]
                 
-        # Convert all keys to string representation for JSON
+        # Get client ids as strings and convert to list for JSON serialization
         client_ids = [f"{ip}:{port}" for ip, port in client_streams.keys()]
         
         # Get detection status for each client
         client_statuses = {}
         for addr in client_streams.keys():
             client_id = f"{addr[0]}:{addr[1]}"
+            
+            # Ensure detected_gender is JSON serializable
+            detected_gender = client_streams[addr].get('detected_gender', [])
+            if isinstance(detected_gender, set):
+                detected_gender = list(detected_gender)
+            
             client_statuses[client_id] = {
                 'motion_detected': client_streams[addr].get('motion_detected', False),
                 'fight_detected': client_streams[addr].get('fight_detected', False),
-                'detected_gender': client_streams[addr].get('detected_gender', None),
+                'detected_gender': detected_gender[0] if detected_gender else None,
                 'mode': detection_settings[addr].get('mode', None),
-                'active': detection_settings[addr].get('active', False)
+                'active': detection_settings[addr].get('active', False),
+                'target_gender': detection_settings[addr].get('target_gender', None)
             }
             
     return jsonify({
@@ -430,19 +464,6 @@ def toggle_detection(client_id):
     gender = data.get('gender', None)
     active = data.get('active', False)
 
-    if gender == 'None':
-        detection_settings[addr]['active'] = False
-        detection_settings[addr]['target_gender'] = None
-        detection_settings[addr]['last_alert'] = None
-        return jsonify({'status': 'Detection deactivated'})
-
-    if gender not in genderList:
-        return jsonify({'error': 'Invalid gender'}), 400
-
-    detection_settings[addr]['active'] = True
-    detection_settings[addr]['target_gender'] = gender
-    detection_settings[addr]['last_alert'] = None
-    return jsonify({'status': f'Detection ON for {gender}'})
     if not mode:
         return jsonify({'error': 'Detection mode not specified'}), 400
 
@@ -464,6 +485,7 @@ def toggle_detection(client_id):
     else:
         return jsonify({'error': 'Invalid detection mode'}), 400
 
+
 @app.route('/video_feed/<client_id>')
 def video_feed(client_id):
     def generate():
@@ -477,28 +499,14 @@ def video_feed(client_id):
             addr = safe_client_id_to_tuple(client_id)
             with streams_lock:
                 stream_data = client_streams.get(addr) if addr else None
+                settings = detection_settings.get(addr, {'active': False, 'target_gender': None, 'last_alert': None})
 
             if stream_data:
-                frame = cv2.imdecode(np.frombuffer(stream_data['frame'], np.uint8), cv2.IMREAD_COLOR)
-                if settings['active']:
-                    frame, detected_genders = apply_gender_detection(frame, addr)
-                    if settings['target_gender'] in detected_genders:
-                        if settings.get('last_alert') != settings['target_gender']:
-                            print(f"🔔 ALERT: {settings['target_gender']} detected for {addr}")
-                            settings['last_alert'] = settings['target_gender']
-                    else:
-                        settings['last_alert'] = None
-
-                _, buffer = cv2.imencode('.jpg', frame)
-                frame_bytes = buffer.tobytes()
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
-                       stream_data['frame'] + b'\r\n')
+                frame = stream_data['frame']
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
             else:
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
-                       no_signal_frame + b'\r\n')
-
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(0.033)
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + no_signal_frame + b'\r\n')
+            
             time.sleep(0.033)  # ~30fps
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
