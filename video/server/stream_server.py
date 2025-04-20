@@ -519,17 +519,17 @@ def process_motion_detection(frame, addr):
     
     # Display motion and fight detection status
     if fight_detected:
-        status_text = "FIGHT DETECTED!"
+        status_text = ""
         status_color = (0, 0, 255)
     else:
-        status_text = "No Fight"
-        status_color = (0, 255, 0)
+        status_text = "Unauthorized acess detected"
+        status_color = (0, 0, 255)
     
     cv2.putText(frame, status_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
     
-    motion_status_text = "Motion: DETECTED" if motion_detected else "Motion: NOT DETECTED"
-    motion_status_color = (0, 0, 255) if motion_detected else (0, 255, 0)
-    cv2.putText(frame, motion_status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, motion_status_color, 2)
+    #motion_status_text = "Motion: DETECTED" if motion_detected else "Motion: NOT DETECTED"
+    #motion_status_color = (0, 0, 255) if motion_detected else (0, 255, 0)
+    #cv2.putText(frame, motion_status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, motion_status_color, 2)
     
     # Update client stream data with detection results
     with streams_lock:
