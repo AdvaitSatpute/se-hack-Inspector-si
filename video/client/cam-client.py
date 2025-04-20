@@ -8,7 +8,7 @@ def send_video():
     while True:
         try:
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.connect(('10.10.40.59', 9999))  # Replace with server IP
+            client_socket.connect(('10.10.114.125', 9999))  # Replace with server IP
             print("Connected to server successfully")
             cam = cv2.VideoCapture(0)
             
