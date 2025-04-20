@@ -10,8 +10,30 @@ from flask import Flask, Response, jsonify, render_template, request, redirect, 
 from ast import literal_eval
 from collections import defaultdict
 from ultralytics import YOLO  # YOLOv8
+# Violence detection model
+import tensorflow as tf
+from collections import deque
 
 app = Flask(__name__, template_folder='../templates', static_folder='../static')
+
+CONFIDENCE_THRESHOLD = 0.85  # High threshold for precision
+CONSECUTIVE_DETECTIONS_REQUIRED = 5  # Multiple consecutive detections before alerting
+ALERT_COOLDOWN = 10  # Seconds between alerts
+violence_frames_buffers = defaultdict(list)
+prediction_histories = defaultdict(lambda: deque(maxlen=12))
+motion_histories = defaultdict(lambda: deque(maxlen=12))
+face_size_histories = defaultdict(lambda: deque(maxlen=8))
+alert_counters = defaultdict(int)
+alert_statuses = defaultdict(bool)
+last_alert_times = defaultdict(float)
+
+
+try:
+    violence_model = tf.keras.models.load_model('models/cnn_lstm_model.keras')
+    print("Violence detection model loaded successfully")
+except Exception as e:
+    print(f"Failed to load violence detection model: {e}")
+    violence_model = None
 
 # Dictionary to hold client streams with thread-safe access
 client_streams = {}
@@ -63,6 +85,213 @@ unattended_objects = defaultdict(dict)
 object_id_counters = defaultdict(int)
 background_models = {}
 
+def preprocess_frame(frame, target_size=224):
+    """Preprocess frame for violence detection model input"""
+    resized = cv2.resize(frame, (target_size, target_size))
+    normalized = resized.astype(np.float32) / 255.0
+    return normalized
+
+def distance_correction(prediction, face_size, addr):
+    """Apply distance-based correction to prediction"""
+    if len(face_size_histories[addr]) < 3:
+        return prediction
+    
+    # Calculate average face size
+    avg_face_size = sum(face_size_histories[addr]) / len(face_size_histories[addr])
+    
+    if avg_face_size > 0:
+        # Apply distance correction
+        # Large face = close to camera = higher chance of false positive
+        # So we reduce the prediction confidence when face is large/close
+        distance_factor = min(1.0, 10000 / max(avg_face_size, 1))
+        
+        # Apply stronger correction when face is very close
+        if avg_face_size > 15000:  # Very close face
+            prediction *= (distance_factor * 0.7)
+        elif avg_face_size > 8000:  # Moderately close face
+            prediction *= (distance_factor * 0.85)
+    
+    return prediction
+
+def complex_temporal_filtering(new_prediction, motion_level, addr):
+    """Apply complex temporal filtering with motion context"""
+    prediction_histories[addr].append(new_prediction)
+    motion_histories[addr].append(motion_level)
+    
+    if len(prediction_histories[addr]) < 5:
+        return new_prediction
+    
+    # Calculate motion pattern (increasing, stable, decreasing)
+    recent_motion = list(motion_histories[addr])[-5:]
+    motion_increasing = sum(recent_motion[-2:]) > sum(recent_motion[:2])
+    
+    # Apply different filtering strategies based on motion pattern
+    if motion_increasing:
+        # Rapid motion increase - be more sensitive to potential fights
+        weights = np.linspace(0.5, 1.0, len(prediction_histories[addr]))
+        weights = weights / np.sum(weights)  # Normalize weights
+        smoothed = sum(w * p for w, p in zip(weights, prediction_histories[addr]))
+    else:
+        # Stable or decreasing motion - require more consistent evidence
+        smoothed = sum(prediction_histories[addr]) / len(prediction_histories[addr])
+        
+        # Further reduce if motion is very low
+        if motion_level < 0.005:
+            smoothed = smoothed * 0.5  # Strong reduction for static scenes
+    
+    return smoothed
+
+def check_alert_status(prediction, current_time, addr):
+    """Manage alert state to prevent false alarms"""
+    # Check if prediction exceeds threshold
+    if prediction > CONFIDENCE_THRESHOLD:
+        alert_counters[addr] += 1
+        # Require consecutive detections before triggering alert
+        if alert_counters[addr] >= CONSECUTIVE_DETECTIONS_REQUIRED:
+            # Only trigger new alert if cooldown period has passed
+            if not alert_statuses[addr] and (current_time - last_alert_times.get(addr, 0)) > ALERT_COOLDOWN:
+                alert_statuses[addr] = True
+                last_alert_times[addr] = current_time
+                print(f"\n⚠️ ALERT: Fight detected with high confidence for client {addr}!")
+    else:
+        # Reset counter if prediction drops below threshold
+        alert_counters[addr] = max(0, alert_counters[addr] - 1)
+        
+        # Turn off alert if counter drops significantly
+        if alert_counters[addr] < 2:
+            alert_statuses[addr] = False
+    
+    return alert_statuses[addr]
+
+def process_violence_detection(frame, addr):
+    """Apply violence detection model to the frame"""
+    # If model isn't loaded, return frame with error message
+    if violence_model is None:
+        cv2.putText(frame, "Violence model not loaded!", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        return frame, False, 0.0
+    
+    current_time = time.time()
+    
+    # Calculate motion level
+    with streams_lock:
+        if addr in client_streams and 'prev_frame' in client_streams[addr]:
+            prev_frame = client_streams[addr]['prev_frame']
+        else:
+            prev_frame = None
+    
+    if prev_frame is not None:
+        # Convert to grayscale
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate absolute difference
+        frame_diff = cv2.absdiff(prev_gray, curr_gray)
+        _, thresh = cv2.threshold(frame_diff, 15, 255, cv2.THRESH_BINARY)
+        
+        # Calculate percentage of pixels that changed
+        motion_level = np.sum(thresh) / (thresh.shape[0] * thresh.shape[1] * 255)
+    else:
+        motion_level = 0.0
+    
+    # Store current frame for next comparison
+    with streams_lock:
+        if addr in client_streams:
+            client_streams[addr]['prev_frame'] = frame.copy()
+    
+    # Detect faces for distance estimation
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+    
+    largest_face_size = 0
+    for (x, y, w, h) in faces:
+        # Draw rectangle around faces for visualization
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+        face_size = w * h
+        largest_face_size = max(largest_face_size, face_size)
+    
+    # Update face size history
+    face_size_histories[addr].append(largest_face_size)
+    
+    # Process frame for model input
+    processed_frame = preprocess_frame(frame)
+    
+    # Update frames buffer
+    violence_frames_buffers[addr].append(processed_frame)
+    if len(violence_frames_buffers[addr]) > 16:  # Keep only last 16 frames
+        violence_frames_buffers[addr].pop(0)
+    
+    current_prediction = 0.0
+    
+    # Make prediction if we have enough frames
+    if len(violence_frames_buffers[addr]) == 16:
+        frames_input = np.expand_dims(np.array(violence_frames_buffers[addr]), axis=0)
+        raw_prediction = violence_model.predict(frames_input, verbose=0)[0][0]
+        
+        # Apply temporal filtering with motion context
+        filtered_prediction = complex_temporal_filtering(raw_prediction, motion_level, addr)
+        
+        # Apply distance-based correction
+        current_prediction = distance_correction(filtered_prediction, largest_face_size, addr)
+        
+        # Check alert status
+        alert_status = check_alert_status(current_prediction, current_time, addr)
+    else:
+        alert_status = False
+    
+    # Display prediction and information
+    result_frame = display_prediction(frame, current_prediction, motion_level, largest_face_size, alert_status)
+    
+    return result_frame, alert_status, current_prediction
+
+def display_prediction(frame, prediction, motion_level, face_size, alert_active):
+    """Display prediction and relevant information on the frame"""
+    display_frame = frame.copy()
+    
+    # Choose color and text based on prediction and alert status
+    if alert_active:
+        color = (0, 0, 255)  # Red for active alert
+        text = f"⚠️ FIGHT DETECTED ⚠️"
+        # Add alert animation (flashing border)
+        border_thickness = int(time.time() * 4) % 10 + 2
+        cv2.rectangle(display_frame, (0, 0), (display_frame.shape[1], display_frame.shape[0]), 
+                    color, border_thickness)
+    elif prediction > CONFIDENCE_THRESHOLD:
+        color = (0, 140, 255)  # Orange for high confidence but not yet alerting
+        text = f"Potential Fight ({prediction:.2f})"
+    else:
+        color = (0, 255, 0)  # Green for no fight
+        text = f"No Fight ({prediction:.2f})"
+    
+    # Add semi-transparent overlay
+    overlay = display_frame.copy()
+    cv2.rectangle(overlay, (0, 0), (display_frame.shape[1], 110), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0, display_frame)
+    
+    # Add text with all relevant information
+    cv2.putText(display_frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    cv2.putText(display_frame, f"Motion: {motion_level:.3f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+    cv2.putText(display_frame, f"Face Size: {face_size}", (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+    
+    # Add threshold visualization bar
+    bar_width = 200
+    bar_height = 20
+    bar_x = display_frame.shape[1] - bar_width - 10
+    bar_y = 30
+    
+    # Draw background bar
+    cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (100, 100, 100), -1)
+    
+    # Draw prediction level
+    pred_width = int(prediction * bar_width)
+    cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + pred_width, bar_y + bar_height), color, -1)
+    
+    # Draw threshold line
+    threshold_x = bar_x + int(CONFIDENCE_THRESHOLD * bar_width)
+    cv2.line(display_frame, (threshold_x, bar_y - 5), (threshold_x, bar_y + bar_height + 5), (255, 255, 255), 2)
+    
+    return display_frame
 
 def safe_client_id_to_tuple(client_id):
     """Safely convert client_id string to tuple format"""
@@ -492,15 +721,24 @@ def handle_client(conn, addr):
                     motion_detected = False
                     fight_detected = False
                     unattended_count = 0
+                    violence_prediction = 0.0
                 elif settings['mode'] == 'motion':
                     processed_frame, motion_detected, fight_detected = process_motion_detection(original_frame, addr)
                     detected_gender = []
                     unattended_count = 0
+                    violence_prediction = 0.0
                 elif settings['mode'] == 'unattended':
                     processed_frame, unattended_count = process_unattended_object_detection(original_frame, addr)
                     motion_detected = False
                     fight_detected = False
                     detected_gender = []
+                    violence_prediction = 0.0
+                elif settings['mode'] == 'violence':
+                    # New mode for violence detection
+                    processed_frame, fight_detected, violence_prediction = process_violence_detection(original_frame, addr)
+                    motion_detected = False
+                    detected_gender = []
+                    unattended_count = 0
                 else:
                     # Default to original frame if unknown mode
                     processed_frame = original_frame
@@ -508,6 +746,7 @@ def handle_client(conn, addr):
                     fight_detected = False
                     detected_gender = []
                     unattended_count = 0
+                    violence_prediction = 0.0
             else:
                 # If detection is not active, just use the original frame
                 processed_frame = original_frame
@@ -515,6 +754,7 @@ def handle_client(conn, addr):
                 fight_detected = False
                 detected_gender = []
                 unattended_count = 0
+                violence_prediction = 0.0
             
             ret, buffer = cv2.imencode('.jpg', processed_frame)
             if not ret:
@@ -527,7 +767,9 @@ def handle_client(conn, addr):
                     'motion_detected': motion_detected,
                     'fight_detected': fight_detected,
                     'detected_gender': detected_gender,
-                    'unattended_objects': unattended_count
+                    'unattended_objects': unattended_count,
+                    'violence_prediction': violence_prediction,
+                    'prev_frame': original_frame.copy()  # Store for motion calculation
                 }
     except Exception as e:
         print(f"Client {addr} error: {str(e)}")
@@ -540,6 +782,15 @@ def handle_client(conn, addr):
                 del unattended_objects[addr]
             if addr in background_models:
                 del background_models[addr]
+            # Clean up violence detection data
+            if addr in violence_frames_buffers:
+                del violence_frames_buffers[addr]
+            if addr in prediction_histories:
+                del prediction_histories[addr]
+            if addr in motion_histories:
+                del motion_histories[addr]
+            if addr in face_size_histories:
+                del face_size_histories[addr]
         conn.close()
         print(f"Connection closed: {addr}")
 
@@ -610,6 +861,7 @@ def active_streams():
                 'fight_detected': client_streams[addr].get('fight_detected', False),
                 'detected_gender': detected_gender[0] if detected_gender else None,
                 'unattended_objects': client_streams[addr].get('unattended_objects', 0),
+                'violence_prediction': client_streams[addr].get('violence_prediction', 0.0),
                 'mode': detection_settings[addr].get('mode', None),
                 'active': detection_settings[addr].get('active', False),
                 'target_gender': detection_settings[addr].get('target_gender', None),
@@ -653,6 +905,13 @@ def toggle_detection(client_id):
         return jsonify({'status': 'Motion detection ' + ('activated' if active else 'deactivated')})
     elif mode == 'unattended':
         return jsonify({'status': 'Unattended object detection ' + ('activated' if active else 'deactivated')})
+    elif mode == 'violence':
+        # Reset violence detection buffers when toggling
+        if addr in violence_frames_buffers:
+            violence_frames_buffers[addr] = []
+        alert_counters[addr] = 0
+        alert_statuses[addr] = False
+        return jsonify({'status': 'Violence detection ' + ('activated' if active else 'deactivated')})
     else:
         return jsonify({'error': 'Invalid detection mode'}), 400
 
@@ -757,7 +1016,8 @@ def system_info():
         'face_detection': faceNet is not None,
         'gender_detection': genderNet is not None,
         'pose_detection': yolo_model is not None,
-        'hand_detection': use_hand_dnn
+        'hand_detection': use_hand_dnn,
+        'violence_detection': violence_model is not None
     }
     
     active_clients = len(client_streams)
@@ -765,7 +1025,7 @@ def system_info():
     return jsonify({
         'models_loaded': models_loaded,
         'active_clients': active_clients,
-        'detection_modes': ['gender', 'motion', 'unattended']
+        'detection_modes': ['gender', 'motion', 'unattended', 'violence']
     })
 
 
