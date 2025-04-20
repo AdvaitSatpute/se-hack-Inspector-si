@@ -252,7 +252,7 @@ def display_prediction(frame, prediction, motion_level, face_size, alert_active)
     # Choose color and text based on prediction and alert status
     if alert_active:
         color = (0, 0, 255)  # Red for active alert
-        text = f"⚠️ FIGHT DETECTED ⚠️"
+        text = f"⚠️ UNAUTHORIZED ENTRY DETECTED ⚠️"
         # Add alert animation (flashing border)
         border_thickness = int(time.time() * 4) % 10 + 2
         cv2.rectangle(display_frame, (0, 0), (display_frame.shape[1], display_frame.shape[0]), 
@@ -520,12 +520,33 @@ def process_motion_detection(frame, addr):
     # Display motion and fight detection status
     if fight_detected:
         status_text = ""
-        status_color = (0, 0, 255)
     else:
-        status_text = "Unauthorized acess detected"
-        status_color = (0, 0, 255)
+        status_text = " Unauthorized Access Detected "
+
+    # Font settings
+    font = cv2.FONT_HERSHEY_SIMPLEX  # SIMPLEX is very clean
+    font_scale = 0.6  # Not too big
+    thickness = 1     # Thin but visible
+    color = (0, 0, 0)  # Bright red
+
+    # Get text size
+    (text_width, text_height), _ = cv2.getTextSize(status_text, font, font_scale, thickness)
+
+    # Center the text
+    frame_height, frame_width = frame.shape[:2]
+    x = int((frame_width - text_width) / 2)
+    y = int(frame_height * 0.08)  # a little lower from the top
+
+    # Optional: add soft black shadow for elegance
+    #cv2.putText(frame, status_text, (x+2, y+2), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+    # Draw the hot red text
+    cv2.putText(frame, status_text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+
+    # Draw actual text (red)
+
     
-    cv2.putText(frame, status_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+    #cv2.putText(frame, status_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
     
     #motion_status_text = "Motion: DETECTED" if motion_detected else "Motion: NOT DETECTED"
     #motion_status_color = (0, 0, 255) if motion_detected else (0, 255, 0)
