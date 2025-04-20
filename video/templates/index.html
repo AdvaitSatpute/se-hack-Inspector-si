@@ -109,6 +109,50 @@
             gap: 10px;
             margin-top: 10px;
         }
+        /* New styles for violence detection metrics */
+        .metrics-container {
+            margin-top: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .metric-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px;
+            background-color: #222;
+            border-radius: 4px;
+        }
+        .metric-label {
+            font-weight: bold;
+            color: #ccc;
+        }
+        .metric-value {
+            color: white;
+        }
+        .threshold-controls {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            margin-top: 10px;
+        }
+        .threshold-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .threshold-label {
+            min-width: 100px;
+            color: #ccc;
+        }
+        .threshold-input {
+            flex: 1;
+            padding: 5px;
+            background-color: #333;
+            border: 1px solid #555;
+            border-radius: 4px;
+            color: white;
+        }
     </style>
 </head>
 <body>
@@ -177,6 +221,7 @@
                         modeControlsEl.innerHTML = `
                             <button class="mode-btn gender-mode" onclick="setDetectionMode('${clientId}', 'gender')">Gender Detection</button>
                             <button class="mode-btn motion-mode" onclick="setDetectionMode('${clientId}', 'motion')">Motion Detection</button>
+                            <button class="mode-btn violence-mode" onclick="setDetectionMode('${clientId}', 'violence')">Violence Detection</button>
                             <button class="mode-btn unattended-mode" onclick="setDetectionMode('${clientId}', 'unattended')">Unattended Objects</button>
                         `;
                         controlsEl.appendChild(modeControlsEl);
@@ -193,6 +238,12 @@
                             </select>
                         `;
                         controlsEl.appendChild(genderRowEl);
+                        
+                        // Create violence detection controls
+                        const violenceControlsEl = document.createElement('div');
+                        violenceControlsEl.className = 'violence-controls';
+                        violenceControlsEl.style.display = 'none';
+                        controlsEl.appendChild(violenceControlsEl);
                         
                         // Create background controls row
                         const bgRowEl = document.createElement('div');
@@ -244,26 +295,35 @@
                 const detectionInfo = document.getElementById(`detection-info-${clientId}`);
                 const alertIndicator = document.getElementById(`alert-indicator-${clientId}`);
                 const genderModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .gender-mode`);
+                const violenceModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .violence-mode`);
                 const motionModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .motion-mode`);
                 const unattendedModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .unattended-mode`);
                 const genderControls = document.querySelector(`.video-container[data-client-id="${clientId}"] .gender-controls`);
+                const violenceControls = document.querySelector(`.video-container[data-client-id="${clientId}"] .violence-controls`);
                 
                 // Update active mode buttons
                 genderModeBtn?.classList.remove('active');
                 motionModeBtn?.classList.remove('active');
+                violenceModeBtn?.classList.remove('active');
                 unattendedModeBtn?.classList.remove('active');
+                
+                // Hide all specialized controls first
+                if (genderControls) genderControls.style.display = 'none';
+                if (violenceControls) violenceControls.style.display = 'none';
                 
                 if (status.mode === 'gender') {
                     genderModeBtn?.classList.add('active');
-                    genderControls.style.display = 'flex';
-                } else if (status.mode === 'motion') {
+                    if (genderControls) genderControls.style.display = 'flex';
+                 } else if (status.mode === 'motion') {
                     motionModeBtn?.classList.add('active');
                     genderControls.style.display = 'none';
+                } else if (status.mode === 'violence') {
+                     violenceModeBtn?.classList.add('active');
+                     if (violenceControls) violenceControls.style.display = 'block';
+                    
+                
                 } else if (status.mode === 'unattended') {
                     unattendedModeBtn?.classList.add('active');
-                    genderControls.style.display = 'none';
-                } else {
-                    genderControls.style.display = 'flex';
                 }
                 
                 // Update target gender selection
@@ -304,6 +364,15 @@
                         } else {
                             detectionText = 'No motion detected';
                         }
+                    } else if (status.mode === 'violence') {
+                        if (status.fight_detected) {
+                            detectionText = 'Violence detected!';
+                            alertText = 'ALERT: Violence detected!';
+                        } else if (status.motion_detected) {
+                            detectionText = 'Motion detected';
+                        } else {
+                            detectionText = 'No motion detected';
+                        }
                     } else if (status.mode === 'unattended') {
                         if (status.unattended_objects > 0) {
                             detectionText = `Unattended objects: ${status.unattended_objects}`;
@@ -334,6 +403,22 @@
                 }
             }
             
+            // Get threshold values if in violence mode
+            let thresholds = {};
+            if (mode === 'violence') {
+                const mhiThreshold = document.getElementById(`mhi-threshold-${clientId}`);
+                const violenceThreshold = document.getElementById(`violence-threshold-${clientId}`);
+                const temporalThreshold = document.getElementById(`temporal-threshold-${clientId}`);
+                
+                if (mhiThreshold && violenceThreshold && temporalThreshold) {
+                    thresholds = {
+                        mhi_threshold: parseFloat(mhiThreshold.value),
+                        violence_threshold: parseFloat(violenceThreshold.value),
+                        temporal_threshold: parseFloat(temporalThreshold.value)
+                    };
+                }
+            }
+            
             fetch(`/toggle_detection/${clientId}`, {
                 method: 'POST',
                 headers: {
@@ -342,6 +427,7 @@
                 body: JSON.stringify({
                     mode: mode,
                     gender: gender,
+                    thresholds: thresholds,
                     active: false // Default to inactive when switching modes
                 }),
             })
@@ -374,6 +460,39 @@
             .catch(error => console.error('Error updating gender target:', error));
         }
         
+        function updateThreshold(clientId, type) {
+            const mhiThreshold = document.getElementById(`mhi-threshold-${clientId}`);
+            const violenceThreshold = document.getElementById(`violence-threshold-${clientId}`);
+            const temporalThreshold = document.getElementById(`temporal-threshold-${clientId}`);
+            
+            // Update display values
+            document.getElementById(`mhi-threshold-value-${clientId}`).textContent = 
+                parseFloat(mhiThreshold.value).toFixed(2);
+            document.getElementById(`violence-threshold-value-${clientId}`).textContent = 
+                parseFloat(violenceThreshold.value).toFixed(2);
+            document.getElementById(`temporal-threshold-value-${clientId}`).textContent = 
+                parseFloat(temporalThreshold.value).toFixed(2);
+            
+            fetch(`/update_thresholds/${clientId}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    thresholds: {
+                        mhi_threshold: parseFloat(mhiThreshold.value),
+                        violence_threshold: parseFloat(violenceThreshold.value),
+                        temporal_threshold: parseFloat(temporalThreshold.value)
+                    }
+                }),
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('Thresholds updated:', data);
+            })
+            .catch(error => console.error('Error updating thresholds:', error));
+        }
+        
         function toggleDetection(clientId) {
             const toggleBtn = document.getElementById(`toggle-${clientId}`);
             const isActivating = toggleBtn.textContent === 'Activate';
@@ -381,11 +500,13 @@
             // Determine the current mode
             const genderModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .gender-mode`);
             const motionModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .motion-mode`);
+            const violenceModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .violence-mode`);
             const unattendedModeBtn = document.querySelector(`.video-container[data-client-id="${clientId}"] .unattended-mode`);
             
             let mode = 'none';
             if (genderModeBtn && genderModeBtn.classList.contains('active')) mode = 'gender';
             else if (motionModeBtn && motionModeBtn.classList.contains('active')) mode = 'motion';
+            else if (violenceModeBtn && violenceModeBtn.classList.contains('active')) mode = 'violence';
             else if (unattendedModeBtn && unattendedModeBtn.classList.contains('active')) mode = 'unattended';
             
             // Get gender if in gender mode
@@ -397,6 +518,22 @@
                 }
             }
             
+            // Get thresholds if in violence mode
+            let thresholds = {};
+            if (mode === 'violence') {
+                const mhiThreshold = document.getElementById(`mhi-threshold-${clientId}`);
+                const violenceThreshold = document.getElementById(`violence-threshold-${clientId}`);
+                const temporalThreshold = document.getElementById(`temporal-threshold-${clientId}`);
+                
+                if (mhiThreshold && violenceThreshold && temporalThreshold) {
+                    thresholds = {
+                        mhi_threshold: parseFloat(mhiThreshold.value),
+                        violence_threshold: parseFloat(violenceThreshold.value),
+                        temporal_threshold: parseFloat(temporalThreshold.value)
+                    };
+                }
+            }
+            
             fetch(`/toggle_detection/${clientId}`, {
                 method: 'POST',
                 headers: {
@@ -405,6 +542,7 @@
                 body: JSON.stringify({
                     mode: mode,
                     gender: gender,
+                    thresholds: thresholds,
                     active: isActivating
                 }),
             })
